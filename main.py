@@ -1,57 +1,87 @@
 #!/usr/bin/env python3
-"""Write this entry's one-line roast to /output/entry.txt for make.fun.
+"""Emit this entry's one-line roast for make.fun.
 
-The entry gate accepts UTF-8 text of 1 to 200 characters that is not only
-white space.  We enforce the same shape here, before anything is written, so
-a bad edit fails in this program instead of at grading time.
+make.fun grades /output/entry.txt: UTF-8, one line, 1-200 characters. This
+program applies that gate before writing, so a bad line fails here with a
+clear message instead of at grading time.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROAST = "My agent backs up its memory every five minutes, then forgets where the backup is."
 
 MIN_CHARS = 1
 MAX_CHARS = 200
-OUTPUT_DIR = Path("/output")
-OUTPUT_FILE = OUTPUT_DIR / "entry.txt"
+DEFAULT_OUTPUT = Path("/output/entry.txt")
 
 
-def validate(text: str) -> str:
-    """Return *text* when it passes the entry gate; raise ValueError otherwise."""
-    if "\n" in text or "\r" in text:
-        raise ValueError("the entry must be a single line")
-    stripped = text.strip()
-    if not MIN_CHARS <= len(stripped) <= MAX_CHARS:
-        raise ValueError(
-            f"the entry must be {MIN_CHARS}-{MAX_CHARS} characters, got {len(stripped)}"
-        )
-    return text
+class GateError(ValueError):
+    """The candidate text would not pass the entry gate."""
 
 
-def write_entry(text: str, output_file: Path = OUTPUT_FILE) -> Path:
-    """Validate *text* and write it as UTF-8, mode 0644, without a trailing newline."""
-    payload = validate(text).encode("utf-8")
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_bytes(payload)
-    output_file.chmod(0o644)
-    return output_file
+@dataclass(frozen=True)
+class Entry:
+    text: str
+
+    @classmethod
+    def checked(cls, text: str) -> "Entry":
+        if "\n" in text or "\r" in text:
+            raise GateError("the entry must be a single line")
+        if text.strip() == "":
+            raise GateError("the entry must not be blank")
+        if not MIN_CHARS <= len(text) <= MAX_CHARS:
+            raise GateError(
+                f"the entry must be {MIN_CHARS}-{MAX_CHARS} characters, got {len(text)}"
+            )
+        return cls(text)
+
+    def write(self, destination: Path = DEFAULT_OUTPUT) -> Path:
+        """Write atomically as UTF-8, mode 0644, no trailing newline."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, staged = tempfile.mkstemp(dir=destination.parent, prefix=".entry-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(self.text.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(staged, 0o644)
+            os.replace(staged, destination)
+        except BaseException:
+            Path(staged).unlink(missing_ok=True)
+            raise
+        return destination
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Write the make.fun roast entry.")
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT,
+                        help="destination file (default: /output/entry.txt)")
+    parser.add_argument("--json", action="store_true",
+                        help="report the result as JSON on stdout")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     try:
-        path = write_entry(ROAST)
-    except (OSError, ValueError) as exc:
+        entry = Entry.checked(ROAST)
+        path = entry.write(args.out)
+        if path.read_bytes() != ROAST.encode("utf-8"):
+            raise OSError(f"{path} does not hold the entry after writing")
+    except (GateError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    written = path.read_bytes().decode("utf-8")
-    if written != ROAST:
-        print(f"error: wrote {written!r}, expected {ROAST!r}", file=sys.stderr)
-        return 1
-    print(written)
+    result = {"path": str(path), "chars": len(ROAST), "bytes": len(ROAST.encode("utf-8"))}
+    print(json.dumps(result) if args.json else ROAST)
     return 0
 
 
